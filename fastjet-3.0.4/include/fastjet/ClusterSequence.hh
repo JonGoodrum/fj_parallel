@@ -45,6 +45,8 @@
 #include "fastjet/LimitedWarning.hh"
 #include "fastjet/FunctionOfPseudoJet.hh"
 #include "fastjet/ClusterSequenceStructure.hh"
+#include <thread>
+#include <mutex>
 
 FASTJET_BEGIN_NAMESPACE      // defined in fastjet/internal/base.hh
 
@@ -62,7 +64,10 @@ class ClusterSequence {
  public: 
 
   /// default constructor
-  ClusterSequence () : _deletes_self_when_unused(false) {}
+  ClusterSequence () : _deletes_self_when_unused(false) {
+               tman = new ThreadManager;
+               tman->singleCore(); //**//
+             _tiles = &singlecoretiles;} //**//
 
 //   /// create a clustersequence starting from the supplied set
 //   /// of pseudojets and clustering them with the long-invariant
@@ -83,7 +88,7 @@ class ClusterSequence {
   /// of pseudojets and clustering them with jet definition specified
   /// by jet_def (which also specifies the clustering strategy)
   template<class L> ClusterSequence (
-			          const std::vector<L> & pseudojets,
+         		          const std::vector<L> & pseudojets,
 				  const JetDefinition & jet_def,
 				  const bool & writeout_combinations = false);
   
@@ -831,6 +836,7 @@ protected:
   //----------------------------------------------------------------------
   /// The fundamental structures to be used for the tiled N^2 algorithm
   /// (see CCN27-44 for some discussion of pattern of tiling)
+  public : //**//
   struct Tile {
     /// pointers to neighbouring tiles, including self
     Tile *   begin_tiles[n_tile_neighbours]; 
@@ -843,9 +849,12 @@ protected:
     /// start of list of BriefJets contained in this tile
     TiledJet * head;    
     /// sometimes useful to be able to tag a tile
-    bool     tagged;    
+    bool     tagged;  
+    int      address ; //**//  
   };
-  std::vector<Tile> _tiles;
+  private : //**//
+  std::vector<Tile> * _tiles; //**//
+  std::vector<Tile> singlecoretiles ; //**//
   double _tiles_eta_min, _tiles_eta_max;
   double _tile_size_eta, _tile_size_phi;
   int    _n_tiles_phi,_tiles_ieta_min,_tiles_ieta_max;
@@ -891,6 +900,156 @@ protected:
   void _simple_N2_cluster_BriefJet();
   /// to avoid issues with template instantiation (OS X 10.3, gcc 3.3)
   void _simple_N2_cluster_EEBriefJet();
+
+////////////start of concurrent information  //**//
+
+
+public :
+  class ThreadManager;  //forward declaration for ctor below
+  void s_NN_INIT( Tile * tile , ThreadManager * tman );
+  void s_CREATE_THREADS( std::vector<Tile> * _tiles , ThreadManager * tman );
+
+  template<class L> ClusterSequence (
+			          const std::vector<L> & pseudojets,
+				  const JetDefinition & jet_def,
+                                  ThreadManager * referent_thread_manager,
+				  std::vector<Tile> * referent_tiles,
+				  const bool & writeout_combinations = false){
+               tman = referent_thread_manager;
+             _tiles = referent_tiles;
+
+             // transfer the initial jets (type L) into our own array
+             _transfer_input_jets(pseudojets);
+
+             // transfer the remaining options
+             _decant_options_partial();
+
+             // run the clustering
+             _initialise_and_run_no_decant();
+}
+
+  class ThreadManager{ //all objects are private, have public get methods
+ 
+    private :
+      bool multi;   // multi, first, and all related methods are
+      bool first;   // only accessed by the main, scheduling thread
+    public :
+      bool getMulti(){ return multi; }
+      bool getFirst(){ return first; }
+      void setFirst(){ first = false; }
+
+            // singleCore method is used by the "regular" ClusterSequence ctor
+    public :  // and multiCore is used before passing in a ThreadManager object
+      void singleCore(){ 
+        multi = false;
+        first = true;
+      }
+      void multiCore(){
+        multi = true;
+        first = true;
+      }
+
+
+    public :
+      std::mutex m_flag;
+      std::mutex m_flow;
+      std::vector<std::mutex*> vm_tiles;
+
+
+    private :
+      unsigned int flag;
+    public :
+      int getFlag(){ return flag; }
+      void decFlag(){ 
+        m_flag.lock();
+          --flag;
+        m_flag.unlock();
+      }
+      void resetFlag( std::vector<Tile> * _tiles ){
+        m_flag.lock();
+          flag = _tiles->size();
+        m_flag.unlock();
+      }
+      void coutFlag( std::string S ){
+        m_flag.lock();
+          std::cout << S << flag;
+        m_flag.unlock();
+      }
+
+
+    private :
+      bool top;
+      bool bottom;
+    public :
+      bool getTop(){ return top; }
+      bool getBottom(){ return bottom; }
+      void openTop(){
+        m_flow.lock();
+        top = true;
+        m_flow.unlock();
+      }
+      void openBottom(){
+        m_flow.lock();
+        bottom = true;
+        m_flow.unlock();
+      }
+      void closeTop(){
+        m_flow.lock();
+        top = false;
+        m_flow.unlock();
+      }
+      void closeBottom(){
+        m_flow.lock();
+        bottom = false;
+        m_flow.unlock();
+      }
+      void waitTop(){
+        while(1){
+          m_flow.lock();
+            if(top) {m_flow.unlock(); break;}
+          m_flow.unlock();
+        }
+      }
+      void waitBottom(){
+        while(1){
+	  m_flow.lock();
+            if(bottom) {m_flow.unlock(); break;}
+          m_flow.unlock();
+        }
+      }
+
+
+    public :
+      void waitOnThreads(){
+        while(1){
+        m_flag.lock();
+            if( flag == 0 ){
+              m_flag.unlock();
+              break;
+            }
+          m_flag.unlock();
+        }
+      }
+      void grabTwoLocks( int Q1, int Q2 ){
+        bool lock1 = false;
+        bool lock2 = false;
+        while(1){
+          lock1 = (vm_tiles[Q1])->try_lock();
+          lock2 = (vm_tiles[Q2])->try_lock();
+          if ((lock1) && (lock2)) { break; }
+          else{
+            if(lock1) { vm_tiles[Q1]->unlock(); }
+            if(lock2) { vm_tiles[Q2]->unlock(); }
+          }
+        }
+      }
+  }; // end ThreadManager Class
+  ThreadManager * tman;
+
+
+
+
+////////////end of concurrent information //**//
 };
 
 
@@ -944,7 +1103,9 @@ template<class L> ClusterSequence::ClusterSequence (
   _jet_def(jet_def_in), _writeout_combinations(writeout_combinations),
   _structure_shared_ptr(new ClusterSequenceStructure(this))
 {
-
+               tman = new ThreadManager;
+               tman->singleCore();
+             _tiles = &singlecoretiles;
   // transfer the initial jets (type L) into our own array
   _transfer_input_jets(pseudojets);
 
